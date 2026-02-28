@@ -1,3 +1,3 @@
-from .duckduckgo import duckduckgo_search
+from .duckduckgo import search, SearchError, SearchBlockedError
 
-__all__ = ["duckduckgo_search"]
+__all__ = ["search", "SearchError", "SearchBlockedError"]

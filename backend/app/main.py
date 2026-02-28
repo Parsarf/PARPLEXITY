@@ -5,8 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 
 from app.schemas import AskRequest, AskResponse, SearchResult, SourceDoc, Chunk, ScoredChunk, SourceRef
-from app.services.search import duckduckgo_search
-from app.services.search.duckduckgo import DuckDuckGoSearchError
+from app.services.search import search as web_search, SearchError, SearchBlockedError
 from app.services.fetch import fetch_url, FetchError, NonHtmlError
 from app.services.extract import extract_main_text
 from app.services.chunking import chunk_source_text_v1
@@ -79,8 +78,8 @@ async def ask(request: AskRequest):
             detail=f"num_results must be between {MIN_NUM_RESULTS} and {MAX_NUM_RESULTS}",
         )
     try:
-        raw = await duckduckgo_search(q, num)
-    except DuckDuckGoSearchError:
+        raw = await web_search(q, num)
+    except (SearchError, SearchBlockedError):
         raise HTTPException(status_code=502, detail="Search failed")
 
     # Defensive: skip any malformed result so one bad URL cannot crash /ask

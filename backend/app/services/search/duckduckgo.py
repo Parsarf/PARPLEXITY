@@ -171,10 +171,8 @@ async def _ddg_search(
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}&kl=us-en"
     headers = {
         "User-Agent": _next_ua(),
-        # DDG respects these and is less likely to serve a stripped page
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://duckduckgo.com/",
         "DNT": "1",
     }

@@ -15,22 +15,28 @@ A Perplexity-style search and answer API built with FastAPI. It searches DuckDuc
 ```
 backend/
   app/
-    main.py          # FastAPI app and /ask endpoint orchestration
+    main.py          # FastAPI app and /ask endpoint orchestration (Phases 1-6)
     config.py        # Environment variable loading (OPENAI_API_KEY, OPENAI_MODEL)
-    schemas.py       # Pydantic models
+    schemas.py       # Pydantic models (incl. AnswerClaim, AnswerQuality)
     services/
-      search/        # DuckDuckGo HTML scraper
+      search/        # DuckDuckGo HTML scraper + SearXNG fallback
       fetch/         # Async HTTP fetcher
       extract/       # Readability-based text extraction
-      chunking/      # Text chunking
-      retrieval/     # Keyword-based chunk ranking
+      chunking/      # Text chunking (paragraph-aware)
+      retrieval/     # Keyword-based chunk ranking with diversity
       answer/        # OpenAI answer generation with citations
+      quality/       # Phase 6: Trust + Quality
+        claim_parser.py       # Split answer into claims, extract citations
+        citation_enforcer.py  # Enforce multi-source + citation coverage (OpenAI repair)
+        support_verifier.py   # Deterministic keyword-based claim verification
+        contradiction.py      # Detect contradictions between sources
+        confidence.py         # Compute confidence score (high/medium/low)
 ```
 
 ## Endpoints
 
 - `GET /health` — returns `{"status": "ok"}`
-- `POST /ask` — body: `{"query": "...", "num_results": 8}` — returns full AskResponse with search results, sources, chunks, and a cited answer
+- `POST /ask` — body: `{"query": "...", "num_results": 8}` — returns AskResponse with search results, sources, chunks, cited answer, answer_claims (verified), and quality metrics
 
 ## Configuration
 

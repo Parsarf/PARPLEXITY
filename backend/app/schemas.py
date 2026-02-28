@@ -55,6 +55,25 @@ class SourceRef(BaseModel):
     url: HttpUrl
 
 
+class AnswerClaim(BaseModel):
+    """One atomic claim with citations and verification."""
+
+    text: str
+    citations: list[str] = []
+    supported: bool = False
+    support_notes: Optional[str] = None
+
+
+class AnswerQuality(BaseModel):
+    """Quality metrics for the generated answer."""
+
+    confidence: str
+    distinct_sources_used: int
+    citation_coverage: float
+    unsupported_claims: int
+    contradictions_detected: bool
+
+
 class AskResponse(BaseModel):
     query: str
     results: list[SearchResult]
@@ -64,3 +83,5 @@ class AskResponse(BaseModel):
     answer: Optional[str] = None
     source_map: list[SourceRef] = []
     answer_error: Optional[str] = None
+    answer_claims: list[AnswerClaim] = []
+    quality: Optional[AnswerQuality] = None

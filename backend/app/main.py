@@ -1,10 +1,14 @@
 import asyncio
+import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 
-from app.schemas import AskRequest, AskResponse, SearchResult, SourceDoc, Chunk, ScoredChunk, SourceRef
+from app.schemas import (
+    AskRequest, AskResponse, SearchResult, SourceDoc,
+    Chunk, ScoredChunk, SourceRef, AnswerClaim, AnswerQuality,
+)
 from app.services.search import search as web_search, SearchError, SearchBlockedError
 from app.services.fetch import fetch_url, FetchError, NonHtmlError
 from app.services.extract import extract_main_text
@@ -16,9 +20,21 @@ from app.services.answer import (
     generate_cited_answer_with_retry,
     OpenAIAnswerError,
 )
+from app.services.quality import (
+    split_into_claims,
+    extract_citations,
+    enforce_citations_and_multisource,
+    build_source_text_lookup,
+    verify_claims,
+    detect_contradictions,
+    add_disagreement_note,
+    compute_confidence,
+)
 from app import config
 
-app = FastAPI(title="Perplexity-style Backend", version="0.2.0")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Perplexity-style Backend", version="0.6.0")
 
 MAX_QUERY_LENGTH = 400
 MIN_NUM_RESULTS = 1
@@ -38,7 +54,6 @@ async def _build_source_doc(
     result: dict[str, Any],
     semaphore: asyncio.Semaphore,
 ) -> SourceDoc:
-    """Fetch URL, extract text, return SourceDoc. On failure, return SourceDoc with error set."""
     title = result.get("title") or ""
     url = result["url"]
     snippet = result.get("snippet") or None
@@ -82,7 +97,6 @@ async def ask(request: AskRequest):
     except (SearchError, SearchBlockedError):
         raise HTTPException(status_code=502, detail="Search failed")
 
-    # Defensive: skip any malformed result so one bad URL cannot crash /ask
     results = []
     for r in raw:
         try:
@@ -95,7 +109,6 @@ async def ask(request: AskRequest):
     sources = await asyncio.gather(*source_tasks)
     sources_list = list(sources)
 
-    # Phase 3: chunk good sources (error is None, non-empty text)
     all_chunk_dicts: list[dict[str, Any]] = []
     for src in sources_list:
         if src.error is not None or not (src.text or "").strip():
@@ -109,14 +122,14 @@ async def ask(request: AskRequest):
     all_chunk_dicts = all_chunk_dicts[:MAX_CHUNKS_TOTAL]
     chunks_list = [Chunk(**d) for d in all_chunk_dicts]
 
-    # Phase 4: keyword ranking + diversity cap -> top_chunks
     top_chunk_dicts = rank_chunks(q, chunks_list, top_k=10, per_source_cap=2)
     top_chunks_list = [ScoredChunk(**d) for d in top_chunk_dicts]
 
-    # Phase 5: answer synthesis with citations (OpenAI)
     answer: str | None = None
     answer_error: str | None = None
     source_map_list: list[SourceRef] = []
+    context: str = ""
+    chunk_id_to_sid: dict[str, str] = {}
     if not top_chunks_list:
         answer = "I couldn't find relevant source text for this query."
     else:
@@ -134,6 +147,54 @@ async def ask(request: AskRequest):
             answer = None
             answer_error = str(e)
 
+    answer_claims_list: list[AnswerClaim] = []
+    quality: AnswerQuality | None = None
+
+    if answer and source_map_list:
+        try:
+            answer = await enforce_citations_and_multisource(
+                query=q,
+                draft_answer=answer,
+                context=context,
+                source_map=source_map_list,
+                model=config.OPENAI_MODEL,
+                api_key=config.OPENAI_API_KEY or "",
+            )
+            logger.info("Citation enforcement complete")
+
+            raw_claims = split_into_claims(answer)
+            answer_claims_list = [
+                AnswerClaim(
+                    text=c,
+                    citations=extract_citations(c),
+                    supported=False,
+                    support_notes=None,
+                )
+                for c in raw_claims
+            ]
+
+            source_lookup = build_source_text_lookup(top_chunks_list, source_map_list, chunk_id_to_sid)
+            answer_claims_list = verify_claims(answer_claims_list, source_lookup)
+
+            contradictions = detect_contradictions(answer_claims_list, source_lookup)
+            if contradictions:
+                answer = add_disagreement_note(answer, answer_claims_list)
+                logger.info("Contradictions detected, disagreement note added")
+
+            quality = compute_confidence(answer_claims_list, source_map_list, contradictions)
+
+            logger.info(
+                "Phase 6 quality: confidence=%s, distinct_sources=%d, coverage=%.2f, unsupported=%d, contradictions=%s",
+                quality.confidence,
+                quality.distinct_sources_used,
+                quality.citation_coverage,
+                quality.unsupported_claims,
+                quality.contradictions_detected,
+            )
+
+        except Exception as e:
+            logger.warning("Phase 6 quality analysis failed: %s", e, exc_info=True)
+
     return AskResponse(
         query=q,
         results=results,
@@ -143,4 +204,6 @@ async def ask(request: AskRequest):
         answer=answer,
         source_map=source_map_list,
         answer_error=answer_error,
+        answer_claims=answer_claims_list,
+        quality=quality,
     )

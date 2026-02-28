@@ -43,6 +43,18 @@ backend/
 
 Backend runs on **localhost:8000** in development.
 
+## Key Parameters
+
+### Chunking (chunker_v1.py)
+- `target_words=150` — target chunk size for paragraph packing
+- `max_words=250` — hard limit per chunk
+- `min_words=30` — minimum to keep (filters boilerplate)
+
+### Retrieval (keyword_retriever_v1.py)
+- `top_k=10` — max chunks returned
+- `per_source_cap=2` — max chunks per source URL
+- `min_sources=2` — minimum distinct source URLs guaranteed in output
+
 ## Deployment
 
 Configured for autoscale deployment using Gunicorn with Uvicorn workers on port 5000.

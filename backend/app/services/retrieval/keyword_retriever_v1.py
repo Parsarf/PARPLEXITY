@@ -62,9 +62,11 @@ def rank_chunks(
     *,
     top_k: int = 10,
     per_source_cap: int = 2,
+    min_sources: int = 2,
 ) -> list[dict]:
     """
-    Rank chunks by keyword relevance to query; apply diversity cap per source.
+    Rank chunks by keyword relevance to query; apply diversity cap per source
+    and enforce a minimum number of distinct sources in the output.
     Returns list of dicts compatible with ScoredChunk (chunk_id, source_url,
     source_title, chunk_index, text, score). Safe for empty query/chunks.
     """
@@ -72,7 +74,6 @@ def rank_chunks(
     if not query_tokens:
         return []
 
-    # Guardrail: cap how many chunks we score (deterministic order)
     to_score = chunks[:MAX_CHUNKS_TO_SCORE] if chunks else []
 
     scored: list[tuple[float, dict]] = []
@@ -91,20 +92,39 @@ def rank_chunks(
         }
         scored.append((score, d))
 
-    # Sort by score descending
     scored.sort(key=lambda x: -x[0])
 
-    # Diversity: at most per_source_cap chunks per source_url
-    seen_per_source: dict[str, int] = {}
+    selected_ids: set[str] = set()
     out: list[dict] = []
+    seen_per_source: dict[str, int] = {}
+    distinct_sources: set[str] = set()
+
+    all_source_urls = {str(d.get("source_url", "")) for _, d in scored}
+    available_sources = len(all_source_urls)
+    target_min = min(min_sources, available_sources, top_k)
+
+    for _score, d in scored:
+        if len(distinct_sources) >= target_min:
+            break
+        url = str(d.get("source_url", ""))
+        if url in distinct_sources:
+            continue
+        distinct_sources.add(url)
+        seen_per_source[url] = 1
+        selected_ids.add(d["chunk_id"])
+        out.append(d)
+
     for _score, d in scored:
         if len(out) >= top_k:
             break
+        if d["chunk_id"] in selected_ids:
+            continue
         url = str(d.get("source_url", ""))
         count = seen_per_source.get(url, 0)
         if count >= per_source_cap:
             continue
         seen_per_source[url] = count + 1
+        selected_ids.add(d["chunk_id"])
         out.append(d)
 
     return out

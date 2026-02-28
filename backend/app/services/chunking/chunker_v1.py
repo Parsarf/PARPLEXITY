@@ -82,7 +82,7 @@ def _pack_into_chunks(
                     break
                 chunks.append(sub)
             continue
-        if current_words + w > max_words and current:
+        if current_words + w > target_words and current:
             chunks.append(" ".join(current))
             current = [unit]
             current_words = w
@@ -121,9 +121,9 @@ def chunk_source_text_v1(
     source_url: str,
     source_title: str,
     *,
-    target_words: int = 350,
-    max_words: int = 500,
-    min_words: int = 60,
+    target_words: int = 150,
+    max_words: int = 250,
+    min_words: int = 30,
     max_chunks: int = 20,
 ) -> list[dict[str, Any]]:
     """

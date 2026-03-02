@@ -4,12 +4,13 @@ Falls back gracefully and detects bot blocks explicitly.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+
+from app.services.search.exceptions import SearchBlockedError, SearchParseError
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +101,7 @@ _SELECTOR_STRATEGIES = [
         "link":      ".result__a",
         "snippet":   ".result__snippet",
     },
-    # Strategy C – ultra-minimal fallback: grab any <a> with an external href
-    # inside an element that looks like a search result block
+    # Strategy C – minimal fallback: result-like containers with link + snippet
     {
         "container": "div[class*='result']",
         "link":      "a[href]",
@@ -111,6 +111,7 @@ _SELECTOR_STRATEGIES = [
 
 
 def _parse_ddg_html(html: str, num_results: int) -> list[dict[str, str]]:
+    """Parse DDG HTML with multiple selector strategies. No link-dump fallback."""
     soup = BeautifulSoup(html, "lxml")
 
     for strategy in _SELECTOR_STRATEGIES:
@@ -137,30 +138,15 @@ def _parse_ddg_html(html: str, num_results: int) -> list[dict[str, str]]:
             logger.debug("DDG parse succeeded with strategy: %s", strategy["container"])
             return results
 
-    # Last resort: dump all external links from the page
-    logger.warning("All DDG selector strategies failed, falling back to link dump")
-    results = []
-    for a in soup.find_all("a", href=True):
-        if len(results) >= num_results:
-            break
-        url = _extract_url(a["href"])
-        if url and _is_valid_url(url):
-            results.append({
-                "title": a.get_text(strip=True) or url,
-                "url": url,
-                "snippet": "",
-            })
-    return results
+    # No strategy produced valid results — treat as parse failure, do not return random URLs
+    raise SearchParseError(
+        "DDG parse failed (no result containers matched)",
+        provider="ddg",
+        reason="DDG parse failed (no result containers matched)",
+    )
 
 
 # ── DDG search ────────────────────────────────────────────────────────────────
-
-class SearchBlockedError(Exception):
-    """DDG (or another backend) actively blocked the request."""
-
-
-class SearchError(Exception):
-    """Generic search failure."""
 
 
 async def _ddg_search(
@@ -176,140 +162,18 @@ async def _ddg_search(
         "Referer": "https://duckduckgo.com/",
         "DNT": "1",
     }
-    try:
-        r = await client.get(url, headers=headers)
-    except (httpx.ProxyError, httpx.ConnectError, httpx.TransportError) as e:
-        raise SearchBlockedError(f"DDG network-level block: {e}") from e
-
+    # Let network errors (timeout, connect) propagate so facade can raise SearchNetworkError
+    r = await client.get(url, headers=headers)
     block_reason = _detect_block(r.text, r.status_code)
     if block_reason:
-        raise SearchBlockedError(f"DDG blocked ({block_reason})")
+        raise SearchBlockedError(
+            f"DDG blocked ({block_reason})",
+            provider="ddg",
+            reason=block_reason,
+        )
 
     results = _parse_ddg_html(r.text, num_results)
-    if not results:
-        raise SearchError("DDG returned no parseable results")
     return results
 
 
-# ── SearXNG fallback (free, self-hosted instances — public list) ──────────────
-# These are community-run, uptime varies. We try them in parallel and take
-# the first that responds. You can add your own self-hosted instance first.
-
-SEARXNG_INSTANCES = [
-    "https://searx.be",
-    "https://search.mdosch.de",
-    "https://searxng.world",
-    "https://searx.tiekoetter.com",
-]
-
-
-async def _searxng_search(
-    query: str,
-    num_results: int,
-    client: httpx.AsyncClient,
-    instance: str,
-) -> list[dict[str, str]]:
-    url = f"{instance}/search"
-    params = {"q": query, "format": "json", "engines": "google,bing,duckduckgo"}
-    headers = {"User-Agent": _next_ua()}
-    r = await client.get(url, params=params, headers=headers, timeout=10.0)
-    r.raise_for_status()
-    data = r.json()
-    results = []
-    for item in data.get("results", [])[:num_results]:
-        url_ = item.get("url", "")
-        if _is_valid_url(url_):
-            results.append({
-                "title":   item.get("title", ""),
-                "url":     url_,
-                "snippet": item.get("content", ""),
-            })
-    return results
-
-
-async def _searxng_search_any(
-    query: str,
-    num_results: int,
-    client: httpx.AsyncClient,
-) -> list[dict[str, str]]:
-    """Try all SearXNG instances concurrently, return first success."""
-    tasks = {
-        asyncio.create_task(
-            _searxng_search(query, num_results, client, inst)
-        ): inst
-        for inst in SEARXNG_INSTANCES
-    }
-    pending = set(tasks)
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for t in done:
-            try:
-                result = t.result()
-                if result:
-                    # Cancel remaining
-                    for p in pending:
-                        p.cancel()
-                    return result
-            except Exception as e:
-                logger.debug("SearXNG instance failed: %s — %s", tasks[t], e)
-    raise SearchError("All SearXNG instances failed")
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-async def search(
-    query: str,
-    num_results: int = 8,
-    *,
-    timeout: float = 15.0,
-    use_fallback: bool = True,
-) -> list[dict[str, str]]:
-    """
-    Search the web. Returns list of {"title", "url", "snippet"} dicts.
-
-    Strategy:
-      1. Try DuckDuckGo HTML scraping
-      2. On block / parse failure → try SearXNG JSON API (multiple instances)
-
-    Raises SearchError only if ALL backends fail.
-    """
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=timeout,
-    ) as client:
-        # ── Primary: DDG ──────────────────────────────────────────────────────
-        try:
-            results = await _ddg_search(query, num_results, client)
-            logger.info("DDG search succeeded: %d results", len(results))
-            return results
-        except SearchBlockedError as e:
-            logger.warning("DDG blocked, trying fallback. Reason: %s", e)
-        except SearchError as e:
-            logger.warning("DDG parse failed, trying fallback. Reason: %s", e)
-
-        # ── Fallback: SearXNG ─────────────────────────────────────────────────
-        if not use_fallback:
-            raise SearchError("DDG failed and fallback disabled")
-
-        try:
-            results = await _searxng_search_any(query, num_results, client)
-            logger.info("SearXNG fallback succeeded: %d results", len(results))
-            return results
-        except SearchError:
-            raise SearchError(
-                f"All search backends failed for query: {query!r}"
-            )
-
-
-# ── Convenience sync wrapper ──────────────────────────────────────────────────
-
-def search_sync(query: str, num_results: int = 8) -> list[dict[str, str]]:
-    return asyncio.run(search(query, num_results))
-
-
-# ── Quick smoke test ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import json
-    logging.basicConfig(level=logging.DEBUG)
-    results = search_sync("python asyncio tutorial", num_results=5)
-    print(json.dumps(results, indent=2))
+# Public API is search_facade.search(); this module exposes only _ddg_search for the facade.

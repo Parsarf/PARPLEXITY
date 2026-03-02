@@ -9,7 +9,13 @@ from app.schemas import (
     AskRequest, AskResponse, SearchResult, SourceDoc,
     Chunk, ScoredChunk, SourceRef, AnswerClaim, AnswerQuality,
 )
-from app.services.search import search as web_search, SearchError, SearchBlockedError
+from app.services.search import (
+    search as web_search,
+    SearchError,
+    SearchBlockedError,
+    SearchParseError,
+    SearchNetworkError,
+)
 from app.services.fetch import fetch_url, FetchError, NonHtmlError
 from app.services.extract import extract_main_text
 from app.services.chunking import chunk_source_text_v1
@@ -34,7 +40,7 @@ from app import config
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Perplexity-style Backend", version="0.6.0")
+app = FastAPI(title="Perplexity-style Backend", version=config.APP_VERSION)
 
 MAX_QUERY_LENGTH = 400
 MIN_NUM_RESULTS = 1
@@ -94,8 +100,11 @@ async def ask(request: AskRequest):
         )
     try:
         raw = await web_search(q, num)
-    except (SearchError, SearchBlockedError):
-        raise HTTPException(status_code=502, detail="Search failed")
+    except (SearchError, SearchBlockedError, SearchParseError, SearchNetworkError) as e:
+        # Clear failure reporting: safe reason, no secrets (Phase 7)
+        detail = f"Search failed: {e.reason}" if getattr(e, "reason", None) else "Search failed"
+        logger.warning("Search failed: %s", detail)
+        raise HTTPException(status_code=502, detail=detail)
 
     results = []
     for r in raw:

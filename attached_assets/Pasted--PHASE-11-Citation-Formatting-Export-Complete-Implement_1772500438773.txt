@@ -1,0 +1,1027 @@
+# PHASE 11 — Citation Formatting & Export
+
+## Complete Implementation Prompt for AI Coding Agent
+
+---
+
+## YOUR MISSION
+
+You are adding citation formatting and export to an existing Perplexity-style research backend. After you are done, every source used in an answer will have **properly formatted citations** in APA, MLA, Chicago, and BibTeX formats — and users will be able to **export all citations** from a query as a downloadable `.bib` file or structured JSON. This completes the core research workflow: search → read → cite.
+
+You will touch **5 files** (2 new, 3 existing). Every file, every function, every change is described below. Do not improvise. Do not add features not listed here. Follow this document exactly.
+
+---
+
+## BEFORE YOU START — READ THIS
+
+### What the system does today (after Phases 8–10)
+
+1. User sends `POST /ask` with a query
+2. System searches the web, fetches URLs (including PDFs), extracts text
+3. PDFs: extracts structured sections, DOI, authors, metadata via Crossref (Phase 8)
+4. Classifies sources by type and assigns authority scores (Phase 9)
+5. Chunks, ranks, and sends top chunks to OpenAI for a cited answer
+6. Runs quality checks, extracts verified quote-exact evidence blocks (Phase 10)
+7. Returns `AskResponse` with: answer, sources, chunks, top_chunks, evidence_blocks, answer_claims, quality
+
+### What metadata is already available per source
+
+From `SourceDoc.pdf_metadata` (Phase 8, populated for PDFs with DOI via Crossref):
+```python
+{
+    "authors": ["First Last", "First Last"],  # May be [] for HTML sources
+    "doi": "10.xxxx/yyyy",                     # or None
+    "year": 2024,                              # or None
+    "journal": "Nature",                       # or None
+    "volume": "612",                           # or None
+    "issue": "3",                              # or None
+    "publisher": "Springer Nature",            # or None
+    "source_type": "peer_reviewed",            # or None
+    "page_count": 15,
+    "abstract": "...",
+    "sections_found": ["abstract", "introduction", ...],
+}
+```
+
+From `SourceDoc` itself:
+- `title`: Always present (extracted from HTML or PDF)
+- `url`: Always present
+- `source_type`: From Phase 9 classifier (e.g. "peer_reviewed", "news", "blog")
+
+For **HTML sources without a DOI**, most metadata fields will be None or empty. The citation formatter must handle this gracefully — generating the best citation possible with whatever data exists, and flagging missing fields.
+
+### What is missing
+
+- No formatted citations anywhere in the response
+- No way to export citations
+- No way to get a BibTeX file
+- Users who want to cite sources in their papers must manually format everything
+- The metadata exists but is never turned into human-readable citation strings
+
+### What you are building
+
+1. **Citation Formatter** — Takes a source's metadata and generates formatted citation strings in APA 7th, MLA 9th, Chicago 17th, and BibTeX
+2. **Formatted citations on every source in the response** — New field on `SourceDoc` containing all four formats
+3. **Export endpoint** — `GET /export/{query_id}` that returns all citations from a query as BibTeX or JSON
+4. **Query result caching** — Minimal in-memory cache so the export endpoint can reference a previous `/ask` response
+
+---
+
+## PROJECT STRUCTURE — WHAT CHANGES
+
+```
+backend/
+├── app/
+│   ├── main.py                                    # MODIFY (call formatter, store results, add export endpoint)
+│   ├── schemas.py                                 # MODIFY (add CitationFormats model, add to SourceDoc + AskResponse)
+│   ├── services/
+│   │   ├── citation/                              # NEW DIRECTORY
+│   │   │   ├── __init__.py                        # NEW FILE (empty)
+│   │   │   └── formatter.py                       # NEW FILE
+│   │   ├── fetch/                                 # NO CHANGES
+│   │   ├── extract/                               # NO CHANGES
+│   │   ├── chunking/                              # NO CHANGES
+│   │   ├── metadata/                              # NO CHANGES
+│   │   ├── classification/                        # NO CHANGES
+│   │   ├── scoring/                               # NO CHANGES
+│   │   ├── retrieval/                             # NO CHANGES
+│   │   ├── answer/                                # NO CHANGES
+│   │   ├── quality/                               # NO CHANGES
+│   │   ├── evidence/                              # NO CHANGES
+│   │   └── search/                                # NO CHANGES
+```
+
+### No new dependencies
+
+Phase 11 requires **zero new packages**. Citation formatting is pure string manipulation. Do not add anything to `requirements.txt`.
+
+---
+
+## FILE 1: `app/services/citation/formatter.py` (NEW)
+
+### Purpose
+
+Takes metadata about a source and produces formatted citation strings in four formats. Handles incomplete metadata gracefully — every source gets some citation, even if it's minimal.
+
+### Function signatures
+
+```python
+"""
+Citation formatting: APA 7th, MLA 9th, Chicago 17th, and BibTeX.
+"""
+
+import re
+from datetime import datetime, timezone
+
+
+def format_citations(
+    title: str,
+    url: str,
+    authors: list[str] | None = None,
+    year: int | None = None,
+    journal: str | None = None,
+    volume: str | None = None,
+    issue: str | None = None,
+    doi: str | None = None,
+    publisher: str | None = None,
+    source_type: str = "unknown",
+    access_date: str | None = None,
+) -> dict:
+    """
+    Generate formatted citations in multiple styles.
+
+    Args:
+        title: Source title (required).
+        url: Source URL (required).
+        authors: List of author names in "First Last" format.
+        year: Publication year.
+        journal: Journal/publication name.
+        volume: Volume number.
+        issue: Issue number.
+        doi: Digital Object Identifier.
+        publisher: Publisher name.
+        source_type: Classification from Phase 9.
+        access_date: Date accessed, ISO format. Defaults to today.
+
+    Returns:
+        dict with keys:
+            - apa: str (APA 7th edition formatted citation)
+            - mla: str (MLA 9th edition formatted citation)
+            - chicago: str (Chicago 17th edition formatted citation)
+            - bibtex: str (BibTeX entry)
+            - missing_fields: list[str] (fields that were unavailable)
+    """
+```
+
+### Implementation rules (follow exactly)
+
+**Step 0 — Normalize inputs and track missing fields:**
+
+```python
+authors = authors or []
+access_date = access_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+missing_fields = []
+
+if not authors:
+    missing_fields.append("authors")
+if year is None:
+    missing_fields.append("year")
+if source_type in ("peer_reviewed", "preprint") and not journal:
+    missing_fields.append("journal")
+```
+
+**Step 1 — Build author format helpers:**
+
+```python
+def _apa_authors(names: list[str]) -> str:
+    """Format authors for APA: 'Last, F. I., Last, F. I., & Last, F. I.'"""
+    if not names:
+        return ""
+    formatted = []
+    for name in names:
+        parts = name.strip().split()
+        if len(parts) >= 2:
+            last = parts[-1]
+            initials = " ".join(p[0] + "." for p in parts[:-1])
+            formatted.append(f"{last}, {initials}")
+        elif len(parts) == 1:
+            formatted.append(parts[0])
+    if len(formatted) == 1:
+        return formatted[0]
+    elif len(formatted) == 2:
+        return f"{formatted[0]} & {formatted[1]}"
+    else:
+        return ", ".join(formatted[:-1]) + ", & " + formatted[-1]
+
+
+def _mla_authors(names: list[str]) -> str:
+    """Format authors for MLA: 'Last, First, et al.' (first author inverted, rest normal)."""
+    if not names:
+        return ""
+    parts = names[0].strip().split()
+    if len(parts) >= 2:
+        first_author = f"{parts[-1]}, {' '.join(parts[:-1])}"
+    else:
+        first_author = names[0]
+    if len(names) == 1:
+        return first_author
+    elif len(names) == 2:
+        return f"{first_author}, and {names[1]}"
+    else:
+        return f"{first_author}, et al."
+
+
+def _chicago_authors(names: list[str]) -> str:
+    """Format authors for Chicago: same as MLA first author inversion, then normal order."""
+    if not names:
+        return ""
+    parts = names[0].strip().split()
+    if len(parts) >= 2:
+        first_author = f"{parts[-1]}, {' '.join(parts[:-1])}"
+    else:
+        first_author = names[0]
+    if len(names) == 1:
+        return first_author
+    elif len(names) == 2:
+        return f"{first_author}, and {names[1]}"
+    elif len(names) <= 10:
+        middle = ", ".join(names[1:-1])
+        return f"{first_author}, {middle}, and {names[-1]}"
+    else:
+        return f"{first_author}, et al."
+
+
+def _bibtex_key(authors: list[str], year: int | None, title: str) -> str:
+    """Generate a BibTeX citation key: lastnameyearfirstword."""
+    last = ""
+    if authors:
+        parts = authors[0].strip().split()
+        last = parts[-1].lower() if parts else "unknown"
+    else:
+        last = "unknown"
+    yr = str(year) if year else "nd"
+    # First significant word of title (skip articles)
+    skip = {"a", "an", "the", "on", "in", "of", "for", "and", "to"}
+    words = re.findall(r"[a-zA-Z]+", title.lower())
+    first_word = "untitled"
+    for w in words:
+        if w not in skip:
+            first_word = w
+            break
+    return f"{last}{yr}{first_word}"
+
+
+def _escape_bibtex(text: str) -> str:
+    """Escape special BibTeX characters."""
+    # BibTeX special chars: & % $ # _ { } ~ ^
+    for ch in ("&", "%", "$", "#", "_", "{", "}", "~", "^"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+```
+
+**Step 2 — Format APA 7th:**
+
+APA format depends on source type:
+
+```python
+def _format_apa(title, url, authors, year, journal, volume, issue, doi, publisher, source_type, access_date):
+    parts = []
+
+    # Authors
+    author_str = _apa_authors(authors)
+    if author_str:
+        parts.append(author_str)
+
+    # Year
+    if year:
+        parts.append(f"({year}).")
+    else:
+        parts.append("(n.d.).")
+
+    # Title
+    if source_type in ("peer_reviewed", "preprint") and journal:
+        # Journal article: title not italicized, journal italicized
+        parts.append(f"{title}.")
+        journal_part = f"*{journal}*"
+        if volume:
+            journal_part += f", *{volume}*"
+            if issue:
+                journal_part += f"({issue})"
+        parts.append(journal_part + ".")
+    else:
+        # Web page / other: title italicized
+        parts.append(f"*{title}*.")
+
+    # DOI or URL
+    if doi:
+        parts.append(f"https://doi.org/{doi}")
+    else:
+        parts.append(f"Retrieved {access_date}, from {url}")
+
+    return " ".join(parts)
+```
+
+**Step 3 — Format MLA 9th:**
+
+```python
+def _format_mla(title, url, authors, year, journal, volume, issue, doi, publisher, source_type, access_date):
+    parts = []
+
+    # Authors
+    author_str = _mla_authors(authors)
+    if author_str:
+        parts.append(author_str + ".")
+
+    # Title
+    if source_type in ("peer_reviewed", "preprint") and journal:
+        # Article title in quotes, journal italicized
+        parts.append(f'"{title}."')
+        journal_part = f"*{journal}*"
+        if volume:
+            journal_part += f", vol. {volume}"
+        if issue:
+            journal_part += f", no. {issue}"
+        if year:
+            journal_part += f", {year}"
+        parts.append(journal_part + ".")
+    else:
+        # Web page: title italicized
+        parts.append(f"*{title}*.")
+        if publisher:
+            parts.append(f"{publisher},")
+        if year:
+            parts.append(f"{year}.")
+
+    # DOI or URL
+    if doi:
+        parts.append(f"https://doi.org/{doi}.")
+    else:
+        parts.append(f"Accessed {access_date}. {url}.")
+
+    return " ".join(parts)
+```
+
+**Step 4 — Format Chicago 17th (Notes-Bibliography style):**
+
+```python
+def _format_chicago(title, url, authors, year, journal, volume, issue, doi, publisher, source_type, access_date):
+    parts = []
+
+    # Authors
+    author_str = _chicago_authors(authors)
+    if author_str:
+        parts.append(author_str + ".")
+
+    # Title
+    if source_type in ("peer_reviewed", "preprint") and journal:
+        parts.append(f'"{title}."')
+        journal_part = f"*{journal}*"
+        if volume:
+            journal_part += f" {volume}"
+            if issue:
+                journal_part += f", no. {issue}"
+        if year:
+            journal_part += f" ({year})"
+        parts.append(journal_part + ".")
+    else:
+        parts.append(f"*{title}*.")
+        if publisher:
+            parts.append(f"{publisher}.")
+        if year:
+            parts.append(f"{year}.")
+
+    # DOI or URL
+    if doi:
+        parts.append(f"https://doi.org/{doi}.")
+    else:
+        parts.append(f"Accessed {access_date}. {url}.")
+
+    return " ".join(parts)
+```
+
+**Step 5 — Format BibTeX:**
+
+```python
+def _format_bibtex(title, url, authors, year, journal, volume, issue, doi, publisher, source_type):
+    key = _bibtex_key(authors, year, title)
+
+    # Determine entry type
+    if source_type in ("peer_reviewed",) and journal:
+        entry_type = "article"
+    elif source_type == "book":
+        entry_type = "book"
+    elif source_type == "preprint":
+        entry_type = "unpublished"
+    else:
+        entry_type = "misc"
+
+    safe_title = _escape_bibtex(title)
+
+    lines = [f"@{entry_type}{{{key},"]
+    lines.append(f'  title = {{{safe_title}}},')
+
+    if authors:
+        # BibTeX author format: "Last, First and Last, First"
+        bib_authors = []
+        for name in authors:
+            parts = name.strip().split()
+            if len(parts) >= 2:
+                bib_authors.append(f"{parts[-1]}, {' '.join(parts[:-1])}")
+            else:
+                bib_authors.append(name)
+        lines.append(f'  author = {{{" and ".join(bib_authors)}}},')
+
+    if year:
+        lines.append(f"  year = {{{year}}},")
+
+    if journal:
+        safe_journal = _escape_bibtex(journal)
+        lines.append(f"  journal = {{{safe_journal}}},")
+
+    if volume:
+        lines.append(f"  volume = {{{volume}}},")
+
+    if issue:
+        lines.append(f"  number = {{{issue}}},")
+
+    if publisher:
+        safe_publisher = _escape_bibtex(publisher)
+        lines.append(f"  publisher = {{{safe_publisher}}},")
+
+    if doi:
+        lines.append(f"  doi = {{{doi}}},")
+
+    lines.append(f"  url = {{{url}}},")
+    lines.append("}")
+
+    return "\n".join(lines)
+```
+
+**Step 6 — Assemble the main function:**
+
+```python
+def format_citations(
+    title, url, authors=None, year=None, journal=None, volume=None,
+    issue=None, doi=None, publisher=None, source_type="unknown", access_date=None,
+) -> dict:
+    authors = authors or []
+    access_date = access_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    missing_fields = []
+
+    if not authors:
+        missing_fields.append("authors")
+    if year is None:
+        missing_fields.append("year")
+    if source_type in ("peer_reviewed", "preprint") and not journal:
+        missing_fields.append("journal")
+    if not doi:
+        missing_fields.append("doi")
+
+    apa = _format_apa(title, url, authors, year, journal, volume, issue, doi, publisher, source_type, access_date)
+    mla = _format_mla(title, url, authors, year, journal, volume, issue, doi, publisher, source_type, access_date)
+    chicago = _format_chicago(title, url, authors, year, journal, volume, issue, doi, publisher, source_type, access_date)
+    bibtex = _format_bibtex(title, url, authors, year, journal, volume, issue, doi, publisher, source_type)
+
+    return {
+        "apa": apa,
+        "mla": mla,
+        "chicago": chicago,
+        "bibtex": bibtex,
+        "missing_fields": missing_fields,
+    }
+```
+
+### Formatting edge cases to handle
+
+**No authors:** Use title as first element. APA says use title in author position. MLA says start with title. Both are standard for web pages.
+```python
+# In _format_apa, _format_mla, _format_chicago:
+# If author_str is empty, don't append an empty string — just skip to the next part.
+# The title will be the first element.
+```
+
+**No year:** Use `"(n.d.)"` in APA, omit in MLA/Chicago. In BibTeX, omit the year field entirely.
+
+**No journal for peer-reviewed source:** Format as web resource instead. Track in `missing_fields`.
+
+**Very long author lists (>20):** APA 7th says list first 19 authors, then ellipsis, then last author. Implement this:
+```python
+# In _apa_authors, after the existing logic, add:
+if len(formatted) > 20:
+    return ", ".join(formatted[:19]) + ", ... " + formatted[-1]
+```
+
+**DOI formatting:** Always format as full URL: `https://doi.org/{doi}`. Do NOT use `doi:` prefix.
+
+**Title capitalization:** Do NOT change the title's capitalization. Use it as-is from the source. APA technically requires sentence case for article titles, but we don't have the information to reliably convert — better to preserve the original.
+
+### What NOT to do
+
+- Do NOT call any external APIs. This is pure string formatting.
+- Do NOT attempt to look up missing metadata. That was Phase 8's job.
+- Do NOT generate page ranges (we don't have article page ranges from Crossref consistently).
+- Do NOT try to determine the "container" for every source type. Keep the logic simple: journal articles get journal formatting, everything else gets web formatting.
+- Do NOT add `pages` field handling. It's not reliably available and would add complexity for minimal value.
+
+---
+
+## FILE 2: `app/schemas.py` (MODIFY)
+
+### Changes to make
+
+**Add the `CitationFormats` model:**
+
+```python
+class CitationFormats(BaseModel):
+    apa: str = ""                     # APA 7th edition
+    mla: str = ""                     # MLA 9th edition
+    chicago: str = ""                 # Chicago 17th edition
+    bibtex: str = ""                  # BibTeX entry
+    missing_fields: list[str] = []    # Fields unavailable for complete citation
+```
+
+**Add `citations` field to `SourceDoc`:**
+
+Find the existing `SourceDoc` class. Add this after the Phase 9 fields:
+
+```python
+class SourceDoc(BaseModel):
+    title: str
+    url: str
+    snippet: str
+    text: str = ""
+    error: str | None = None
+    # Phase 8 fields:
+    is_pdf: bool = False
+    pdf_metadata: dict | None = None
+    # Phase 9 fields:
+    source_type: str = "unknown"
+    source_type_confidence: str = "low"
+    source_type_signals: list[str] = []
+    authority_score: float = 1.0
+    authority_breakdown: dict | None = None
+    # --- NEW FIELD FOR PHASE 11 ---
+    citations: CitationFormats | None = None
+```
+
+**Add `query_id` to `AskResponse`:**
+
+This is needed so the export endpoint can reference a specific query result.
+
+```python
+class AskResponse(BaseModel):
+    query: str
+    results: list[SearchResult]
+    sources: list[SourceDoc]
+    chunks: list[Chunk]
+    top_chunks: list[ScoredChunk]
+    answer: str | None = None
+    source_map: list[SourceRef]
+    answer_error: str | None = None
+    answer_claims: list[AnswerClaim] = []
+    quality: AnswerQuality | None = None
+    evidence_blocks: list[EvidenceBlock] = []    # Phase 10
+    # --- NEW FIELD FOR PHASE 11 ---
+    query_id: str | None = None                  # Unique ID for export
+```
+
+**Add `ExportResponse` model:**
+
+```python
+class ExportResponse(BaseModel):
+    query_id: str
+    query: str
+    format: str                         # "bibtex", "json", "apa", "mla", "chicago"
+    sources_count: int
+    content: str                        # The formatted export content
+    missing_metadata_sources: list[str] # URLs of sources with incomplete metadata
+```
+
+### What NOT to change
+
+- Do not modify `EvidenceBlock`, `AnswerClaim`, `AnswerQuality`, `Chunk`, `ScoredChunk`, `SearchResult`, `SourceRef`, `AskRequest`, or `UploadResponse`.
+- `CitationFormats` must be defined BEFORE `SourceDoc` in the file.
+- `ExportResponse` can be defined anywhere after the basic models.
+
+---
+
+## FILE 3: `app/main.py` (MODIFY)
+
+### Change 1: Add imports
+
+```python
+import uuid
+from app.services.citation.formatter import format_citations
+from app.schemas import CitationFormats, ExportResponse
+```
+
+Note: `uuid` may already be imported from Phase 8 (for the upload endpoint). If so, don't import it again.
+
+### Change 2: Generate citations for each source after classification
+
+Find the section where sources are built (after fetch+extract, after Phase 9 classification and scoring). For each source, AFTER classification and scoring are done, add citation formatting:
+
+```python
+# --- PHASE 11: Format citations ---
+try:
+    # Extract metadata for citation formatting
+    pdf_meta = source.pdf_metadata or {}
+
+    citation_data = format_citations(
+        title=source.title,
+        url=source.url,
+        authors=pdf_meta.get("authors"),
+        year=pdf_meta.get("year"),
+        journal=pdf_meta.get("journal"),
+        volume=pdf_meta.get("volume"),
+        issue=pdf_meta.get("issue"),
+        doi=pdf_meta.get("doi"),
+        publisher=pdf_meta.get("publisher"),
+        source_type=source.source_type,
+    )
+    source.citations = CitationFormats(**citation_data)
+except Exception as e:
+    import logging
+    logging.getLogger(__name__).warning(f"Citation formatting failed for {source.url}: {e}")
+    # source.citations stays None (default)
+```
+
+**IMPORTANT:** This runs for EVERY source — both HTML and PDF. For HTML sources without `pdf_metadata`, most fields will be None, and the formatter will generate a minimal web citation (title + URL + access date). This is correct behavior.
+
+### Change 3: Generate a query_id and store the result
+
+At the beginning of the `/ask` endpoint handler, generate a unique query_id:
+
+```python
+query_id = uuid.uuid4().hex[:16]
+```
+
+Add an in-memory result cache at module level (BEFORE the endpoint definitions):
+
+```python
+from collections import OrderedDict
+
+# In-memory cache for query results (for export endpoint)
+# Max 100 entries, LRU eviction
+_query_result_cache: OrderedDict[str, dict] = OrderedDict()
+MAX_QUERY_CACHE_SIZE = 100
+```
+
+AFTER constructing the `AskResponse` but BEFORE returning it, store a copy of the data needed for export:
+
+```python
+# Store result for export endpoint
+_query_result_cache[query_id] = {
+    "query": query,
+    "sources": sources,  # The list of SourceDoc objects
+}
+_query_result_cache.move_to_end(query_id)
+# Evict old entries
+while len(_query_result_cache) > MAX_QUERY_CACHE_SIZE:
+    _query_result_cache.popitem(last=False)
+```
+
+Set `query_id` on the response:
+
+```python
+return AskResponse(
+    query_id=query_id,  # NEW
+    query=query,
+    results=results,
+    sources=sources,
+    # ... all other existing fields ...
+)
+```
+
+### Change 4: Add the export endpoint
+
+Add this AFTER the existing endpoints:
+
+```python
+@app.get("/export/{query_id}")
+async def export_citations(query_id: str, format: str = "bibtex"):
+    """
+    Export citations from a previous /ask query.
+
+    Args:
+        query_id: The query_id from a previous AskResponse.
+        format: One of "bibtex", "json", "apa", "mla", "chicago".
+
+    Returns:
+        ExportResponse with formatted citation content.
+    """
+    # Validate format
+    valid_formats = {"bibtex", "json", "apa", "mla", "chicago"}
+    if format not in valid_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid format '{format}'. Must be one of: {', '.join(sorted(valid_formats))}"
+        )
+
+    # Look up cached result
+    if query_id not in _query_result_cache:
+        raise HTTPException(
+            status_code=404,
+            detail="Query result not found. Results expire after newer queries are processed. Please run the query again."
+        )
+
+    cached = _query_result_cache[query_id]
+    query = cached["query"]
+    sources = cached["sources"]
+
+    # Filter to sources that were actually used (have citations)
+    cited_sources = [s for s in sources if s.citations is not None]
+
+    missing_metadata_sources = []
+
+    if format == "bibtex":
+        # Combine all BibTeX entries
+        entries = []
+        for s in cited_sources:
+            entries.append(s.citations.bibtex)
+            if s.citations.missing_fields:
+                missing_metadata_sources.append(s.url)
+        content = "\n\n".join(entries)
+
+    elif format == "json":
+        # Structured JSON with all formats
+        import json
+        export_data = []
+        for s in cited_sources:
+            entry = {
+                "title": s.title,
+                "url": s.url,
+                "source_type": s.source_type,
+                "citations": {
+                    "apa": s.citations.apa,
+                    "mla": s.citations.mla,
+                    "chicago": s.citations.chicago,
+                    "bibtex": s.citations.bibtex,
+                },
+                "missing_fields": s.citations.missing_fields,
+            }
+            if s.pdf_metadata:
+                entry["doi"] = s.pdf_metadata.get("doi")
+                entry["year"] = s.pdf_metadata.get("year")
+                entry["authors"] = s.pdf_metadata.get("authors", [])
+            export_data.append(entry)
+            if s.citations.missing_fields:
+                missing_metadata_sources.append(s.url)
+        content = json.dumps(export_data, indent=2)
+
+    else:
+        # APA, MLA, or Chicago — plain text list
+        lines = []
+        for s in cited_sources:
+            citation_text = getattr(s.citations, format, "")
+            if citation_text:
+                lines.append(citation_text)
+            if s.citations.missing_fields:
+                missing_metadata_sources.append(s.url)
+        content = "\n\n".join(lines)
+
+    return ExportResponse(
+        query_id=query_id,
+        query=query,
+        format=format,
+        sources_count=len(cited_sources),
+        content=content,
+        missing_metadata_sources=missing_metadata_sources,
+    )
+```
+
+### What NOT to change in main.py
+
+- Do not change the `/health` endpoint.
+- Do not change the `/upload` endpoint or `/upload/{source_id}/chunks` endpoint.
+- Do not change the search, fetch, extract, chunk, retrieval, answer, quality, or evidence logic.
+- Do not change the existing response fields or their computation.
+- Do not change `_upload_store` or any Phase 8/10 storage.
+
+---
+
+## FILE 4: `app/services/citation/__init__.py` (NEW)
+
+Empty file:
+```python
+```
+
+---
+
+## FILE 5: Don't forget `__init__.py`
+
+Ensure `app/services/citation/__init__.py` exists as an empty file. Without it, Python cannot import from the `citation` package.
+
+---
+
+## TESTING INSTRUCTIONS
+
+### Test 1: Citation formatter — journal article with full metadata
+
+```python
+from app.services.citation.formatter import format_citations
+
+result = format_citations(
+    title="Attention Is All You Need",
+    url="https://arxiv.org/abs/1706.03762",
+    authors=["Ashish Vaswani", "Noam Shazeer", "Niki Parmar", "Jakob Uszkoreit"],
+    year=2017,
+    journal="Advances in Neural Information Processing Systems",
+    volume="30",
+    issue=None,
+    doi="10.48550/arXiv.1706.03762",
+    publisher="NeurIPS",
+    source_type="peer_reviewed",
+)
+
+print("APA:", result["apa"])
+# Expected pattern: Vaswani, A., Shazeer, N., Parmar, N., & Uszkoreit, J. (2017). Attention Is All You Need. *Advances in Neural Information Processing Systems*, *30*. https://doi.org/10.48550/arXiv.1706.03762
+
+print("\nMLA:", result["mla"])
+# Expected pattern: Vaswani, Ashish, et al. "Attention Is All You Need." *Advances in Neural Information Processing Systems*, vol. 30, 2017. https://doi.org/10.48550/arXiv.1706.03762.
+
+print("\nChicago:", result["chicago"])
+# Expected pattern: Vaswani, Ashish, Noam Shazeer, Niki Parmar, and Jakob Uszkoreit. "Attention Is All You Need." *Advances in Neural Information Processing Systems* 30 (2017). https://doi.org/10.48550/arXiv.1706.03762.
+
+print("\nBibTeX:", result["bibtex"])
+# Expected pattern: @article{vaswani2017attention, title = {...}, author = {...}, ...}
+
+print("\nMissing:", result["missing_fields"])
+# Expected: [] or ["issue"] — all major fields present
+
+assert "Vaswani" in result["apa"]
+assert "2017" in result["apa"]
+assert result["bibtex"].startswith("@article{")
+```
+
+### Test 2: Citation formatter — web page with minimal metadata
+
+```python
+from app.services.citation.formatter import format_citations
+
+result = format_citations(
+    title="Understanding Machine Learning Basics",
+    url="https://random-blog.com/ml-basics",
+    authors=None,
+    year=None,
+    journal=None,
+    doi=None,
+    publisher=None,
+    source_type="blog",
+)
+
+print("APA:", result["apa"])
+# Expected: *Understanding Machine Learning Basics*. (n.d.). Retrieved 2026-03-02, from https://random-blog.com/ml-basics
+
+print("\nBibTeX:", result["bibtex"])
+# Expected: @misc{unknown_nd_understanding, title = {...}, url = {...}}
+
+print("\nMissing:", result["missing_fields"])
+# Expected: ["authors", "year", "doi"]
+
+assert "n.d." in result["apa"]
+assert "@misc" in result["bibtex"]
+assert len(result["missing_fields"]) >= 2
+```
+
+### Test 3: Citation formatter — government source
+
+```python
+from app.services.citation.formatter import format_citations
+
+result = format_citations(
+    title="COVID-19 Vaccination Guidelines",
+    url="https://www.cdc.gov/vaccines/covid-19/guidelines.html",
+    authors=None,
+    year=2024,
+    journal=None,
+    doi=None,
+    publisher="Centers for Disease Control and Prevention",
+    source_type="gov",
+)
+
+print("APA:", result["apa"])
+print("MLA:", result["mla"])
+print("Chicago:", result["chicago"])
+
+assert "2024" in result["apa"]
+assert "Centers for Disease Control" in result["mla"]
+```
+
+### Test 4: BibTeX special character escaping
+
+```python
+from app.services.citation.formatter import format_citations
+
+result = format_citations(
+    title="Cost-Benefit Analysis: R&D Spending in the US & EU",
+    url="https://example.com/analysis",
+    authors=["John O'Brien"],
+    year=2023,
+    source_type="news",
+)
+
+print("BibTeX:", result["bibtex"])
+# The & should be escaped as \&
+assert "\\&" in result["bibtex"]
+```
+
+### Test 5: End-to-end via /ask — citations appear on sources
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "effects of climate change on coral reefs"}' \
+  | python -m json.tool | grep -A8 '"citations"'
+# Should see citations object with apa, mla, chicago, bibtex on each source
+```
+
+### Test 6: Export endpoint — BibTeX
+
+```bash
+# First, get a query_id from /ask
+QUERY_ID=$(curl -s -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "CRISPR gene editing applications"}' \
+  | python -m json.tool | grep '"query_id"' | head -1 | cut -d'"' -f4)
+
+echo "Query ID: $QUERY_ID"
+
+# Export as BibTeX
+curl "http://localhost:8000/export/$QUERY_ID?format=bibtex"
+# Should return BibTeX entries for all sources
+
+# Export as APA
+curl "http://localhost:8000/export/$QUERY_ID?format=apa"
+# Should return APA formatted citation list
+
+# Export as JSON
+curl "http://localhost:8000/export/$QUERY_ID?format=json"
+# Should return structured JSON with all formats per source
+```
+
+### Test 7: Export endpoint — invalid query_id
+
+```bash
+curl -s http://localhost:8000/export/nonexistent?format=bibtex
+# Should return 404: "Query result not found..."
+```
+
+### Test 8: Export endpoint — invalid format
+
+```bash
+curl -s "http://localhost:8000/export/anyid?format=vancouver"
+# Should return 400: "Invalid format 'vancouver'..."
+```
+
+### Test 9: Verify no regression
+
+```bash
+curl http://localhost:8000/health
+# {"status": "ok"}
+
+# evidence_blocks still present
+curl -s -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "what is photosynthesis"}' \
+  | python -m json.tool | grep '"evidence_blocks"'
+# Should still have evidence_blocks
+
+# Upload still works
+curl -s -X POST http://localhost:8000/upload \
+  -F "file=@test_paper.pdf" \
+  | python -m json.tool | grep '"source_id"'
+# Should still return source_id
+```
+
+---
+
+## COMMON MISTAKES TO AVOID
+
+1. **Formatting citations for only PDF sources.** Every source gets citations — HTML and PDF alike. HTML sources with no metadata get minimal web citations (title + URL + access date). The formatter handles this via the fallback paths.
+
+2. **Crashing on None pdf_metadata.** When extracting metadata for the formatter, always do `pdf_meta = source.pdf_metadata or {}` and then `pdf_meta.get("field")`. HTML sources have `pdf_metadata=None`. If you write `source.pdf_metadata.get("authors")` without the None check, every HTML source crashes.
+
+3. **Forgetting to generate the query_id early.** The `query_id` must be generated at the START of the `/ask` handler (or at least before the response is constructed). If you generate it inside the response constructor, it won't be available for the cache storage step.
+
+4. **Cache growing unbounded.** The `_query_result_cache` must have a max size. Use the `OrderedDict` with LRU eviction pattern shown above. Without eviction, memory grows with every request.
+
+5. **Storing the entire AskResponse in the cache.** Only store what the export endpoint needs: `query` and `sources`. Storing the full response (with all chunks, top_chunks, evidence_blocks) wastes memory. The export endpoint only needs source metadata and citations.
+
+6. **BibTeX keys colliding.** Two sources by the same first author in the same year with the same first title word will get the same key. This is acceptable for Phase 11 — BibTeX tools handle duplicates. Do NOT add complex deduplication logic.
+
+7. **Forgetting the `__init__.py` file.** Without `app/services/citation/__init__.py`, Python can't import the formatter module. You get `ModuleNotFoundError`.
+
+8. **Changing title capitalization.** APA technically requires sentence case for article titles. Do NOT implement this — reliable case conversion requires knowing which words are proper nouns, which we can't determine. Preserve the original title as-is.
+
+9. **Adding new dependencies.** Phase 11 needs ZERO new packages. Citation formatting is string manipulation. Do not add `citeproc`, `pybtex`, `biblib`, or any other citation library. The custom formatter is simpler, more predictable, and has no dependency chain.
+
+10. **Making the export endpoint async when it doesn't need to be.** The export endpoint reads from an in-memory dict and formats strings. It makes no network calls. It can be async (FastAPI handles both), but make sure you're not accidentally `await`-ing synchronous operations.
+
+---
+
+## DEFINITION OF DONE
+
+Phase 11 is complete when ALL of the following are true:
+
+- [ ] Every source in the `/ask` response has a `citations` object with `apa`, `mla`, `chicago`, `bibtex` strings
+- [ ] Sources with full Crossref metadata produce correctly formatted journal article citations
+- [ ] Sources with no metadata produce valid minimal web citations (title + URL + access date)
+- [ ] `missing_fields` accurately lists which citation fields were unavailable
+- [ ] The `/ask` response includes a `query_id` string
+- [ ] `GET /export/{query_id}?format=bibtex` returns valid BibTeX entries for all sources
+- [ ] `GET /export/{query_id}?format=apa` returns APA formatted citations
+- [ ] `GET /export/{query_id}?format=mla` returns MLA formatted citations
+- [ ] `GET /export/{query_id}?format=chicago` returns Chicago formatted citations
+- [ ] `GET /export/{query_id}?format=json` returns structured JSON with all formats
+- [ ] `GET /export/{query_id}` with invalid query_id returns 404
+- [ ] `GET /export/{query_id}?format=invalid` returns 400
+- [ ] BibTeX entries have special characters properly escaped (`&` → `\&`, etc.)
+- [ ] Query result cache has max size (100) and evicts old entries
+- [ ] No new dependencies were added
+- [ ] `/health` still returns `{"status": "ok"}`
+- [ ] `/ask` with evidence_blocks still works (no regression from Phase 10)
+- [ ] `/upload` still works (no regression from Phase 8)
+- [ ] All new functions have docstrings
+- [ ] No API keys or secrets hardcoded anywhere
+- [ ] Citation formatting failures are caught and logged, not crashing the pipeline

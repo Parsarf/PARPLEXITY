@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -8,8 +10,10 @@ from pydantic import ValidationError
 
 from app.schemas import (
     AskRequest, AskResponse, SearchResult, SourceDoc,
-    Chunk, ScoredChunk, SourceRef, AnswerClaim, AnswerQuality, EvidenceBlock, UploadResponse,
+    Chunk, ScoredChunk, SourceRef, AnswerClaim, AnswerQuality, EvidenceBlock,
+    CitationFormats, ExportResponse, UploadResponse,
 )
+from app.services.citation.formatter import format_citations
 from app.services.search import (
     search as web_search,
     SearchError,
@@ -56,6 +60,9 @@ MAX_SOURCES_TO_FETCH = 5
 MAX_CONCURRENT_FETCHES = 4
 TEXT_PREVIEW_MAX_CHARS = 2500
 MAX_CHUNKS_TOTAL = 60
+
+_query_result_cache: OrderedDict[str, dict] = OrderedDict()
+MAX_QUERY_CACHE_SIZE = 100
 
 
 @app.get("/health")
@@ -154,6 +161,8 @@ async def ask(request: AskRequest):
             status_code=400,
             detail=f"num_results must be between {MIN_NUM_RESULTS} and {MAX_NUM_RESULTS}",
         )
+    query_id = uuid.uuid4().hex[:16]
+
     try:
         raw = await web_search(q, num)
     except (SearchError, SearchBlockedError, SearchParseError, SearchNetworkError) as e:
@@ -199,6 +208,24 @@ async def ask(request: AskRequest):
             src.authority_breakdown = scoring["score_breakdown"]
         except Exception as e:
             logger.warning("Authority scoring failed for %s: %s", src.url, e)
+
+        try:
+            pdf_meta = src.pdf_metadata or {}
+            citation_data = format_citations(
+                title=src.title,
+                url=str(src.url),
+                authors=pdf_meta.get("authors"),
+                year=pdf_meta.get("year"),
+                journal=pdf_meta.get("journal"),
+                volume=pdf_meta.get("volume"),
+                issue=pdf_meta.get("issue"),
+                doi=pdf_meta.get("doi"),
+                publisher=pdf_meta.get("publisher"),
+                source_type=src.source_type,
+            )
+            src.citations = CitationFormats(**citation_data)
+        except Exception as e:
+            logger.warning("Citation formatting failed for %s: %s", src.url, e)
 
     all_chunk_dicts = []
     for g in gathered:
@@ -323,7 +350,16 @@ async def ask(request: AskRequest):
 
     evidence_blocks = [EvidenceBlock(**eb) for eb in evidence_blocks_raw] if evidence_blocks_raw else []
 
+    _query_result_cache[query_id] = {
+        "query": q,
+        "sources": sources_list,
+    }
+    _query_result_cache.move_to_end(query_id)
+    while len(_query_result_cache) > MAX_QUERY_CACHE_SIZE:
+        _query_result_cache.popitem(last=False)
+
     return AskResponse(
+        query_id=query_id,
         query=q,
         results=results,
         sources=sources_list,
@@ -399,3 +435,88 @@ async def get_upload_chunks(source_id: str):
     if source_id not in _upload_store:
         raise HTTPException(status_code=404, detail="Upload not found")
     return {"source_id": source_id, "chunks": _upload_store[source_id]}
+
+
+@app.get("/export/{query_id}", response_model=ExportResponse)
+async def export_citations(query_id: str, format: str = "bibtex"):
+    """
+    Export citations from a previous /ask query.
+
+    Args:
+        query_id: The query_id from a previous AskResponse.
+        format: One of "bibtex", "json", "apa", "mla", "chicago".
+
+    Returns:
+        ExportResponse with formatted citation content.
+    """
+    valid_formats = {"bibtex", "json", "apa", "mla", "chicago"}
+    if format not in valid_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid format '{format}'. Must be one of: {', '.join(sorted(valid_formats))}"
+        )
+
+    if query_id not in _query_result_cache:
+        raise HTTPException(
+            status_code=404,
+            detail="Query result not found. Results expire after newer queries are processed. Please run the query again."
+        )
+
+    cached = _query_result_cache[query_id]
+    query = cached["query"]
+    sources = cached["sources"]
+
+    cited_sources = [s for s in sources if s.citations is not None]
+
+    missing_metadata_sources = []
+
+    if format == "bibtex":
+        entries = []
+        for s in cited_sources:
+            entries.append(s.citations.bibtex)
+            if s.citations.missing_fields:
+                missing_metadata_sources.append(str(s.url))
+        content = "\n\n".join(entries)
+
+    elif format == "json":
+        export_data = []
+        for s in cited_sources:
+            entry = {
+                "title": s.title,
+                "url": str(s.url),
+                "source_type": s.source_type,
+                "citations": {
+                    "apa": s.citations.apa,
+                    "mla": s.citations.mla,
+                    "chicago": s.citations.chicago,
+                    "bibtex": s.citations.bibtex,
+                },
+                "missing_fields": s.citations.missing_fields,
+            }
+            if s.pdf_metadata:
+                entry["doi"] = s.pdf_metadata.get("doi")
+                entry["year"] = s.pdf_metadata.get("year")
+                entry["authors"] = s.pdf_metadata.get("authors", [])
+            export_data.append(entry)
+            if s.citations.missing_fields:
+                missing_metadata_sources.append(str(s.url))
+        content = json.dumps(export_data, indent=2)
+
+    else:
+        lines = []
+        for s in cited_sources:
+            citation_text = getattr(s.citations, format, "")
+            if citation_text:
+                lines.append(citation_text)
+            if s.citations.missing_fields:
+                missing_metadata_sources.append(str(s.url))
+        content = "\n\n".join(lines)
+
+    return ExportResponse(
+        query_id=query_id,
+        query=query,
+        format=format,
+        sources_count=len(cited_sources),
+        content=content,
+        missing_metadata_sources=missing_metadata_sources,
+    )

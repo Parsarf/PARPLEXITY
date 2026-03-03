@@ -14,6 +14,16 @@ class SearchResult(BaseModel):
     snippet: Optional[str] = None
 
 
+class CitationFormats(BaseModel):
+    """Formatted citations in multiple academic styles."""
+
+    apa: str = ""
+    mla: str = ""
+    chicago: str = ""
+    bibtex: str = ""
+    missing_fields: list[str] = []
+
+
 class SourceDoc(BaseModel):
     """A source with fetched and extracted main text (or error)."""
 
@@ -29,6 +39,7 @@ class SourceDoc(BaseModel):
     source_type_signals: list[str] = []
     authority_score: float = 1.0
     authority_breakdown: Optional[dict] = None
+    citations: Optional["CitationFormats"] = None
 
 
 class Chunk(BaseModel):
@@ -109,6 +120,18 @@ class AskResponse(BaseModel):
     answer_claims: list[AnswerClaim] = []
     quality: Optional[AnswerQuality] = None
     evidence_blocks: list[EvidenceBlock] = []
+    query_id: Optional[str] = None
+
+
+class ExportResponse(BaseModel):
+    """Export response for citations from a previous query."""
+
+    query_id: str
+    query: str
+    format: str
+    sources_count: int
+    content: str
+    missing_metadata_sources: list[str]
 
 
 class UploadResponse(BaseModel):

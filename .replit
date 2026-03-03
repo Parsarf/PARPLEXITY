@@ -1,10 +1,10 @@
-modules = ["python-3.12"]
+modules = ["python-3.11", "python-3.12"]
 [agent]
 expertMode = true
 
 [nix]
 channel = "stable-25_05"
-packages = ["libxcrypt", "xcodebuild", "zlib"]
+packages = ["freetype", "gumbo", "harfbuzz", "jbig2dec", "libjpeg_turbo", "libxcrypt", "mupdf", "openjpeg", "swig", "xcbuild", "xcodebuild", "zlib"]
 
 [workflows]
 runButton = "Project"

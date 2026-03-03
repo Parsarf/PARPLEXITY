@@ -22,6 +22,13 @@ class SourceDoc(BaseModel):
     snippet: Optional[str] = None
     text: str = ""
     error: Optional[str] = None
+    is_pdf: bool = False
+    pdf_metadata: Optional[dict] = None
+    source_type: str = "unknown"
+    source_type_confidence: str = "low"
+    source_type_signals: list[str] = []
+    authority_score: float = 1.0
+    authority_breakdown: Optional[dict] = None
 
 
 class Chunk(BaseModel):
@@ -34,6 +41,8 @@ class Chunk(BaseModel):
     text: str
     start_char: Optional[int] = None
     end_char: Optional[int] = None
+    section_heading: Optional[str] = None
+    page_number: Optional[int] = None
 
 
 class ScoredChunk(BaseModel):
@@ -45,6 +54,7 @@ class ScoredChunk(BaseModel):
     chunk_index: int
     text: str
     score: float
+    authority_score: float = 1.0
 
 
 class SourceRef(BaseModel):
@@ -74,6 +84,19 @@ class AnswerQuality(BaseModel):
     contradictions_detected: bool
 
 
+class EvidenceBlock(BaseModel):
+    """One evidence block: claim, exact quote from source, verification and page (PDF)."""
+
+    claim: str
+    source_id: str
+    quote: Optional[str] = None
+    quote_context: Optional[str] = None
+    quote_verified: bool = False
+    quote_match_score: float = 0.0
+    quote_match_type: str = "no_quote"
+    page_number: Optional[int] = None
+
+
 class AskResponse(BaseModel):
     query: str
     results: list[SearchResult]
@@ -85,3 +108,16 @@ class AskResponse(BaseModel):
     answer_error: Optional[str] = None
     answer_claims: list[AnswerClaim] = []
     quality: Optional[AnswerQuality] = None
+    evidence_blocks: list[EvidenceBlock] = []
+
+
+class UploadResponse(BaseModel):
+    filename: str
+    title: str
+    authors: list[str]
+    doi: Optional[str] = None
+    abstract: str
+    sections_found: list[str]
+    page_count: int
+    chunks_generated: int
+    source_id: str

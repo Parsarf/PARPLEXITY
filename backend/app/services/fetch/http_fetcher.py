@@ -1,6 +1,6 @@
 """HTTP fetching for URLs. No parsing here."""
 
-from typing import Tuple
+from __future__ import annotations
 
 import httpx
 
@@ -21,14 +21,9 @@ class FetchError(Exception):
 
 
 class NonHtmlError(FetchError):
-    """Raised when content-type is PDF or not text/html."""
+    """Raised when content-type is not text/html or application/pdf."""
 
     pass
-
-
-def _is_pdf_url(url: str) -> bool:
-    url_lower = url.lower().strip()
-    return url_lower.endswith(".pdf") or ".pdf?" in url_lower
 
 
 def _content_type_is_html_or_text(ct: str) -> bool:
@@ -45,15 +40,14 @@ def _content_type_is_pdf(ct: str) -> bool:
     return ct == "application/pdf"
 
 
-async def fetch_url(url: str) -> Tuple[str, str]:
+async def fetch_url(url: str) -> tuple[str, str | None, bytes | None]:
     """
-    Fetch URL and return (content_type, body_text).
+    Fetch URL and return (content_type, body_text_or_none, pdf_bytes_or_none).
+    For HTML: body_text is set, pdf_bytes is None.
+    For PDF: body_text is None, pdf_bytes is raw bytes.
     Uses GET with redirects, retries, and a max-size guard.
-    Raises NonHtmlError for PDF or non-text/html; FetchError on other failures.
+    Raises NonHtmlError for unsupported content-type; FetchError on other failures.
     """
-    if _is_pdf_url(url):
-        raise NonHtmlError("PDF URLs are skipped")
-
     last_error: Exception | None = None
     for attempt in range(NUM_RETRIES + 1):
         try:
@@ -67,7 +61,10 @@ async def fetch_url(url: str) -> Tuple[str, str]:
                 content_type = response.headers.get("content-type", "")
 
                 if _content_type_is_pdf(content_type):
-                    raise NonHtmlError("Content-Type is PDF")
+                    body_bytes = response.content
+                    if len(body_bytes) > MAX_BODY_BYTES:
+                        body_bytes = body_bytes[:MAX_BODY_BYTES]
+                    return (content_type, None, body_bytes)
                 if not _content_type_is_html_or_text(content_type):
                     raise NonHtmlError(f"Unsupported content-type: {content_type}")
 
@@ -80,7 +77,7 @@ async def fetch_url(url: str) -> Tuple[str, str]:
                 if len(text.encode("utf-8")) > MAX_BODY_BYTES:
                     text = text[:MAX_BODY_BYTES]
 
-                return content_type, text
+                return (content_type, text, None)
         except httpx.HTTPError as e:
             last_error = e
             if attempt == NUM_RETRIES:

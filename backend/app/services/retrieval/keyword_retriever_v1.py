@@ -63,12 +63,22 @@ def rank_chunks(
     top_k: int = 10,
     per_source_cap: int = 2,
     min_sources: int = 2,
+    source_authority: dict | None = None,
 ) -> list[dict]:
     """
-    Rank chunks by keyword relevance to query; apply diversity cap per source
-    and enforce a minimum number of distinct sources in the output.
-    Returns list of dicts compatible with ScoredChunk (chunk_id, source_url,
-    source_title, chunk_index, text, score). Safe for empty query/chunks.
+    Rank chunks by keyword relevance, blended with source authority scores.
+
+    Args:
+        query: User query string.
+        chunks: List of chunk dicts or Chunk objects.
+        top_k: Max chunks to return.
+        per_source_cap: Max chunks per source.
+        min_sources: Minimum distinct sources to include.
+        source_authority: Optional dict mapping source_url → authority_score (float).
+                          If None, authority is not used (backward compatible).
+
+    Returns:
+        List of ScoredChunk-compatible dicts.
     """
     query_tokens = tokenize(query or "")
     if not query_tokens:
@@ -79,18 +89,34 @@ def rank_chunks(
     scored: list[tuple[float, dict]] = []
     for ch in to_score:
         text = (ch.text or "") if hasattr(ch, "text") else ""
-        score = score_text(query_tokens, text)
-        if score == 0.0:
+        keyword_score = score_text(query_tokens, text)
+        if keyword_score == 0.0:
             continue
+        chunk_source_url = str(ch.source_url) if hasattr(ch, "source_url") else str(ch.get("source_url", ""))
         d = {
             "chunk_id": ch.chunk_id,
             "source_url": ch.source_url,
             "source_title": ch.source_title,
             "chunk_index": ch.chunk_index,
             "text": ch.text,
-            "score": round(score, 4),
+            "score": round(keyword_score, 4),
+            "authority_score": source_authority.get(chunk_source_url, 1.0) if source_authority else 1.0,
         }
-        scored.append((score, d))
+        scored.append((keyword_score, d))
+
+    if not scored:
+        return []
+
+    max_keyword_score = max(s for s, _ in scored)
+    if source_authority is not None and max_keyword_score > 0:
+        for i, (kw_score, d) in enumerate(scored):
+            url = str(d.get("source_url", ""))
+            authority = source_authority.get(url, 1.0)
+            normalized_kw = kw_score / max_keyword_score
+            normalized_auth = authority / 15.0
+            blended = (0.7 * normalized_kw) + (0.3 * normalized_auth)
+            scored[i] = (blended, d)
+            d["score"] = round(blended, 4)
 
     scored.sort(key=lambda x: -x[0])
 
